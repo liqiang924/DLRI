@@ -1,0 +1,124 @@
+#load data
+setwd("J:/radiomics1")
+fig1_data=read.xlsx("fig1_data.xls",sheetIndex = 1)
+FD_FU=read.xlsx("FD_FU2.xlsx",sheetIndex = 1)
+FD_FU=FD_FU[complete.cases(FD_FU$UMS),]
+FD_FU$Tumor.size=ifelse(FD_FU$Tumor.size.cm.>1,"＞1cm","≤1cm")
+FD_FU$DFI=as.factor(FD_FU$DFI)
+
+feature_64 <- read.csv("feature_64_4.csv")
+feature_64$UMS=as.character(feature_64$UMS)
+tj_rad=feature_64[feature_64$UMS%in%fig1_data$UMS,]
+tj_rad=left_join(tj_rad,fig1_data[,c(11,14,74)])
+feature_FD=read.csv("feature_FD.csv")
+fd_rad=feature_FD[feature_FD$UMS%in%FD_FU$UMS,]
+fd_rad=left_join(fd_rad,FD_FU[,c(1,40,41,43)])
+
+sampleInfor_t <- read.xlsx("sampleInfor_1108.xls",sheetIndex = 1)
+sampleInfor_t$DFI.time=as.numeric(sampleInfor_t$DFI.time)
+sampleInfor_t$DFI=as.numeric(sampleInfor_t$DFI)
+rownames(sampleInfor_t)=sampleInfor_t$UMS
+options(scipen = 200)
+feature_t <- read.csv("feature_36941.csv")
+feature_t$UMS=as.character(feature_t$U_ARC_CODE)
+a1= list.files("image_thy1",recursive=T, all.files = T)
+library(stringr)
+a2=as.data.frame(str_split(a1,'/',n=3,simplify = T))
+a2$v4=a1
+a2$ArchiveCode=str_extract(a2$V1,'[0-9]+')
+feature_t1=feature_t[which(feature_t$filename%in%a2$V3),]
+
+sampleInfor_t1=sampleInfor_t[unique(feature_t1$UMS),]
+sampleInfor_t1=sampleInfor_t1[complete.cases(sampleInfor_t1$UMS),]
+sampleInfor_t1$Tumor.size=ifelse(sampleInfor_t1$Tumor.size.cm.>1,"＞1cm","≤1cm")
+sampleInfor_t1$DFI=as.factor(sampleInfor_t1$DFI)
+f_tj1108=merge(feature_t1,sampleInfor_t1[,c(2:17,37:44)])
+
+#code for feature filtering
+library(tidyverse)
+library(tidymodels)
+pbp_rec <- recipe(Molecular_group ~ ., data = tj_rad[,c(3:2050,2051)])  %>%
+  step_corr(all_numeric(), threshold = 0.8) %>% 
+  step_zv(all_predictors()) %>% 
+  prep()
+tj_proc <- bake(pbp_rec, new_data = NULL)
+tj_proc=as.data.frame(tj_proc)
+fd_proc <- bake(pbp_rec, new_data = fd_rad)
+
+#code for running lasso
+library(glmnet)
+x <- as.matrix(tj_proc[,-ncol(tj_proc)])
+y <- as.matrix(ifelse(tj_proc$Molecular_group=="Non-inflammatory",0,1))
+set.seed(000)
+lasso_fit <- cv.glmnet(x, y,family  = 'binomial',type.measure = "deviance",nfolds = 5)
+lasso_fit
+coefficient <- coef(lasso_fit, s = 'lambda.min')
+activate.index <- which(as.numeric(coefficient)!=0)
+activate.coffeicients <- as.numeric(coefficient)[activate.index]
+sig_factor_multi <- rownames(coefficient)[activate.index] 
+activate.coffeicients1=as.data.frame(activate.coffeicients,sig_factor_multi)
+activate.coffeicients1$name=sig_factor_multi
+colnames(activate.coffeicients1)=c("Coefficient","name")
+activate.coffeicients1=activate.coffeicients1[-1,]
+activate.coffeicients1$correlation <- ifelse(activate.coffeicients1$Coefficient > 0,'positive correlation','negative correlation')
+x <- as.matrix(tj_proc[,rownames(activate.coffeicients1[abs(activate.coffeicients1$Coefficient)>0.5,])])
+y <- as.matrix(ifelse(tj_proc$Molecular_group=="Non-inflammatory",0,1))
+set.seed(000)
+lasso_fit <- cv.glmnet(x, y,family  = 'binomial',type.measure = "deviance",nfolds = 5)
+lasso_fit
+plot(lasso_fit,las=1,xlab="Log(lambda)")
+plot(lasso_fit$glmnet.fit,xvar="lambda",las=1,lwd=2,xlab="Log(lambda)")
+abline(v=log(lasso_fit$lambda.min),lwd=1,lty=3,col="black")
+
+#code for roc curve
+library("pROC")
+tj_rad$radprob_rna_c=predict(lasso_fit, newx=as.matrix(x) , s=c(lasso_fit$lambda.min),type = c("response") )
+rad1=tj_rad[,c(1,2,2051:2053)]
+rad1$rad1=-(log(1-rad1$radprob_rna_c))
+r1=aggregate(rad1$rad1,by=list(rad1$UMS),FUN=mean)
+colnames(r1)=c("UMS","RNA_RAD_score")
+train1=merge(fig1_data,r1)
+rocobj=roc(train1$Molecular_group,train1$RNA_RAD_score)
+rocobj
+plot(rocobj,
+     print.auc=TRUE, print.auc.x=0.4, print.auc.y=0.5,
+     print.thres=TRUE, print.thres.cex=0.9,
+     auc.polygon=TRUE, auc.polygon.col="#fff7f7", 
+     max.auc.polygon=FALSE,  
+     smooth=F, 
+     col="#FF2E63",  
+     legacy.axes=TRUE) 
+
+#code for survival curve
+library("survival")
+tj_proc1 <- bake(pbp_rec, new_data = f_tj1108)
+f_tj1108$radprob_rna_c=predict(lasso_fit, newx=as.matrix(tj_proc1[,colnames(x)]) , s=c(lasso_fit$lambda.min),type = c("response") )
+rad1=f_tj1108[,c(1,2050:2078)]
+rad1$rad1=-(log(1-rad1$radprob_rna_c))
+r1=aggregate(rad1$rad1,by=list(rad1$UMS),FUN=mean)
+colnames(r1)=c("UMS","RNA_RAD_score")
+tj_1108=merge(sampleInfor_t1,r1)
+median(tj_1108$RNA_RAD_score)
+tj_1108$RNA_RAD_prob=ifelse(tj_1108$RNA_RAD_score>=0.91,"Inflammatory","Non-inflammatory")
+table(tj_1108$RNA_RAD_prob)
+tj_1108$DFI=ifelse(tj_1108$DFI==0,0,1)
+coxph(Surv(DFI.time,DFI) ~ RNA_RAD_prob,data = tj_1108)
+fit <- survfit(Surv(DFI.time,DFI) ~ RNA_RAD_prob,data = tj_1108)
+ggsurvplot(fit,data = tj_1108,
+           linetype = 1,
+           conf.int = T,conf.int.style='step',
+           pval = T,pval.method = T,
+           surv.median.line = 'hv',
+           risk.table = T,risk.table.pos='in',
+           title="Survival curve of FU cohort 1 patients", 
+           ggtheme = theme_classic(base_size = 12),
+           palette=c("#B2182B", "#2166AC"),
+           ylab=c("DFS probability")
+)
+
+
+
+
+
+
+
