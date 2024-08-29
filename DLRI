@@ -1,3 +1,143 @@
+#code for turnning the picture in BMP format into JEPG in batches 
+import os
+import cv2
+bmp_dir = r'/mnt/Vol01/ThyroidCaner_WES_RNA/QL/radiomics/image/FD/bmp1'
+jpg_dir = r'/mnt/Vol01/ThyroidCaner_WES_RNA/QL/radiomics/image/FD/jpg1'
+filelists = os.listdir(bmp_dir)
+for i,file in enumerate(filelists):  
+    img = cv2.imread(os.path.join(bmp_dir,file),-1)
+    newName = file.replace('.bmp','.jpg')
+    cv2.imwrite(os.path.join(jpg_dir,newName),img)
+
+#code for ResNet50
+cd /mnt/Vol01/ThyroidCaner_WES_RNA/QL/radiomics
+conda activate radiomics
+np.random.seed(7)
+import pandas as pd
+manifest2 = pd.DataFrame(columns=['filename', 'U_ARC_CODE', 'IMG_PATH', 'train_split', 'l_lxc_adj'])
+import os
+i = 0
+for root, dirs, files in os.walk("/mnt/Vol01/ThyroidCaner_WES_RNA/QL/radiomics/image/test_thy"):
+    for file in files:                
+        path = os.path.join(root,file)
+        Ucode = path.split('/')
+        if len(Ucode)<7:
+            continue
+        # print(Ucode)       
+        fname = Ucode[10]
+        u_code = Ucode[8][:12]
+        manifest2.loc[i] = [fname, u_code, path, 2, 1]
+        i += 1
+
+import shutil
+import os
+
+os.makedirs("/mnt/Vol01/ThyroidCaner_WES_RNA/QL/radiomics/image/test_thy_2")
+
+for file in manifest2.IMG_PATH.values:
+    shutil.copy(file,"/mnt/Vol01/ThyroidCaner_WES_RNA/QL/radiomics/image/test_thy_2")
+
+import os
+import math
+import h5py
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+
+from keras.models import Model
+from keras.utils import multi_gpu_model
+from keras.preprocessing.image import ImageDataGenerator
+
+from utils import dt, getLayerIndexByName, save_memery_info, get_memory_info
+import os,argparse
+import tensorflow as tf
+from keras import layers
+from keras.models import Model
+
+from models import base_models
+
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, roc_auc_score
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--gpu", default='0,1,2,3')
+parser.add_argument("--from_stage", default=13, type=int)
+parser.add_argument("--is_test", default=1, type=int)
+
+parser.add_argument("--weights_dir", default='./ModelWeights/')
+
+parser.add_argument("--image_size", default=(384, 384))
+parser.add_argument("--image_size_chn", default=(384, 384, 3))
+FLAGS = parser.parse_args()
+os.environ["CUDA_VISIBLE_DEVICES"] = FLAGS.gpu
+
+def flow_from_dataframe(img_data_gen, in_df, path_col, y_col, **dflow_args):
+    base_dir = os.path.dirname(in_df[path_col].values[0])
+    print(base_dir)
+    print('## Ignore next message from keras, values are replaced anyways')
+    df_gen = img_data_gen.flow_from_directory(base_dir, 
+                                     class_mode = 'sparse',       
+                                    shuffle=False,
+                                    **dflow_args)                
+    df_gen.filenames = in_df[path_col].values 
+    df_gen.classes = np.stack(in_df[y_col].values) 
+    # df_gen.samples = in_df .shape[0] 
+    df_gen.n = in_df.shape[0]  
+    df_gen._set_index_array() 
+    df_gen.filepaths.extend(df_gen.filenames)
+    df_gen.directory = '' 
+    print('Reinserting dataframe: {} images'.format(in_df.shape[0]))
+    return df_gen
+
+core_idg = ImageDataGenerator(samplewise_center=False, 
+                                  samplewise_std_normalization=False,  
+                                  horizontal_flip=True,  
+                                  vertical_flip=False, 
+                                  height_shift_range=0.1,  
+                                  width_shift_range=0.1, 
+                                  rotation_range=5,  
+                                  shear_range=0.01,  
+                                  fill_mode='nearest')
+test_idg = ImageDataGenerator()
+    
+manifest2['l_lxc_adj'] = manifest2['l_lxc_adj'].apply(str)
+test_df  = manifest2[manifest2['train_split'] == 2]
+
+test_gen = test_idg.flow_from_dataframe(
+            dataframe=test_df,
+            directory='/mnt/Vol01/ThyroidCaner_WES_RNA/QL/radiomics/image/test_thy_2',
+            x_col='filename',
+            y_col='l_lxc_adj',
+            target_size=(384,384),
+            batch_size=1,
+            class_mode='sparse'
+    ,shuffle=False, validate_filenames=False
+)
+
+base_model = base_models(FLAGS.image_size_chn)
+xx = base_model.output
+xx = layers.GlobalAveragePooling2D(name='gla17')(xx)  
+predictions = layers.Dense(1, activation='sigmoid', kernel_initializer='he_normal', name='classifier')(xx)
+full_model = Model(inputs=base_model.input,
+                         outputs=predictions 
+                         )
+
+model_stage = 'bottom_%s.h5' % str(FLAGS.from_stage)
+print('Loading model from ' + model_stage)
+full_model.load_weights(FLAGS.weights_dir + model_stage, by_name=True)
+
+model = Model(inputs=full_model.input, outputs=full_model.get_layer('gla17').output)
+
+intermediate_output = model.predict_generator(test_gen, steps=len(test_gen), verbose=1, workers=0)
+
+intermediate_output1 = np.reshape(intermediate_output,(1549,2048))
+intermediate_output1 = pd.DataFrame(intermediate_output1)
+intermediate_output1.to_csv('feature_36941.csv', index=False, encoding='gb2312')
+intermediate_output2 = intermediate_output1.join(test_df)
+test_df.to_csv('df_all.csv', index=False, encoding='gb2312')
+
 #load data
 setwd("J:/radiomics1")
 fig1_data=read.xlsx("fig1_data.xls",sheetIndex = 1)
@@ -115,10 +255,5 @@ ggsurvplot(fit,data = tj_1108,
            palette=c("#B2182B", "#2166AC"),
            ylab=c("DFS probability")
 )
-
-
-
-
-
 
 
